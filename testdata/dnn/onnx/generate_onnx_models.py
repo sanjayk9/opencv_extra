@@ -3724,3 +3724,39 @@ def generate_deconv_transform_add():
     export(deconv_add, (x, residual), ["input", "residual"], "deconv_transform_add_broadcast")
 
 generate_deconv_transform_add()
+
+def generate_deconv_gemm():
+    import onnxruntime as ort
+
+    def export(deconv, x, name):
+        with torch.no_grad():
+            deconv.weight.uniform_(-0.5, 0.5)
+            deconv.bias.uniform_(-0.2, 0.2)
+        deconv.eval()
+        path = os.path.join("models", name + ".onnx")
+        with torch.no_grad():
+            expected = deconv(x)
+            torch.onnx.export(deconv, x, path, input_names=["input"], output_names=["output"],
+                              opset_version=13, dynamo=False)
+        actual = ort.InferenceSession(path).run(None, {"input": x.numpy()})[0]
+        max_diff = np.abs(actual - expected.numpy()).max()
+        assert max_diff < 1e-5, "PyTorch/onnxruntime mismatch for {}: {}".format(name, max_diff)
+        np.save(os.path.join("data", "input_" + name + ".npy"), x.numpy())
+        np.save(os.path.join("data", "output_" + name + ".npy"), np.ascontiguousarray(expected.numpy()))
+
+    torch.manual_seed(5)
+
+    # kernel == stride: every output pixel gets exactly one tap (SAM decoder upsampling);
+    # 20 output channels leave the last channel block partial
+    export(nn.ConvTranspose2d(16, 20, kernel_size=2, stride=2), torch.empty(1, 16, 6, 5).uniform_(-1, 1),
+           "deconv_k2s2")
+
+    # overlapping taps with 40 output channels, split into several channel chunks, the last one partial
+    export(nn.ConvTranspose2d(16, 40, kernel_size=3, stride=2, padding=1, output_padding=1),
+           torch.empty(1, 16, 7, 6).uniform_(-1, 1), "deconv_overlap_chunks")
+
+    # two groups of 6 input channels, so the second group starts inside a channel block
+    export(nn.ConvTranspose2d(12, 48, kernel_size=4, stride=2, padding=1, groups=2),
+           torch.empty(2, 12, 5, 6).uniform_(-1, 1), "deconv_overlap_groups")
+
+generate_deconv_gemm()
