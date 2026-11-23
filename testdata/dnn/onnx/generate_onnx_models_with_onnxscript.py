@@ -465,3 +465,89 @@ top_k_input1_arr = np.array(top_k_input1, dtype=np.float32).reshape(3, 4)
 make_model_and_data(top_k,               top_k_input0_arr, save_inputs_as_pb=True, save_outputs_as_pb=True)
 make_model_and_data(top_k_negative_axis, top_k_input0_arr, save_inputs_as_pb=True, save_outputs_as_pb=True)
 make_model_and_data(top_k_smallest,      top_k_input1_arr, save_inputs_as_pb=True, save_outputs_as_pb=True)
+
+'''
+    Attention blocks as timm (ViT, BEiT), HF (SigLIP) and SAM2 (Hiera) export them.
+'''
+attn_rng = np.random.RandomState(0)
+attn_b, attn_s, attn_h, attn_d = 1, 10, 4, 8
+attn_e = attn_h * attn_d
+
+def attn_tensor(a):
+    a = np.asarray(a, dtype=np.float32)
+    return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, a.shape, a.ravel())
+
+def attn_ints(*values, scalar=False):
+    a = np.array(values, dtype=np.int64)
+    return onnx.helper.make_tensor("", onnx.TensorProto.INT64, [] if scalar else a.shape, a)
+
+def attn_weights(*shape, scale=1.0):
+    return (attn_rng.standard_normal(shape) * scale).astype(np.float32)
+
+vit_qkv_w, vit_qkv_b = attn_weights(attn_e, 3 * attn_e, scale=0.2), attn_weights(3 * attn_e, scale=0.1)
+beit_qkv_w, beit_qkv_b = attn_weights(attn_e, 3 * attn_e, scale=0.2), attn_weights(3 * attn_e, scale=0.1)
+beit_rel_bias = attn_weights(1, attn_h, attn_s, attn_s)
+siglip_q_w, siglip_q_b = attn_weights(attn_e, attn_e, scale=0.2), attn_weights(attn_e, scale=0.1)
+siglip_k_w, siglip_k_b = attn_weights(attn_e, attn_e, scale=0.2), attn_weights(attn_e, scale=0.1)
+siglip_v_w, siglip_v_b = attn_weights(attn_e, attn_e, scale=0.2), attn_weights(attn_e, scale=0.1)
+hiera_qkv_w, hiera_qkv_b = attn_weights(attn_e, 3 * attn_e, scale=0.2), attn_weights(3 * attn_e, scale=0.1)
+
+@ost.script()
+def attention_vit_runtime_scale(x: ost.FLOAT[attn_b, attn_s, attn_e]) -> ost.FLOAT[attn_b, attn_s, attn_e]:
+    qkv = op.Add(op.Constant(value=attn_tensor(vit_qkv_b)), op.MatMul(x, op.Constant(value=attn_tensor(vit_qkv_w))))
+    qkv = op.Transpose(op.Reshape(qkv, op.Constant(value=attn_ints(attn_b, attn_s, 3, attn_h, attn_d))), perm=[2, 0, 3, 1, 4])
+    q, k, v = op.Split(qkv, op.Constant(value=attn_ints(1, 1, 1)), axis=0)
+    q = op.Squeeze(q, op.Constant(value=attn_ints(0)))
+    head_dim = op.Cast(op.Slice(op.Shape(q), op.Constant(value=attn_ints(-1)), op.Constant(value=attn_ints(9223372036854775807))), to=1)
+    inv_sqrt_d = op.Div(op.Constant(value=attn_tensor([1.0])), op.Sqrt(head_dim))
+    q = op.Mul(q, op.Sqrt(inv_sqrt_d))
+    k = op.Mul(op.Transpose(op.Squeeze(k, op.Constant(value=attn_ints(0))), perm=[0, 1, 3, 2]), op.Sqrt(inv_sqrt_d))
+    probs = op.Softmax(op.MatMul(q, k), axis=-1)
+    ctx = op.Transpose(op.MatMul(probs, op.Squeeze(v, op.Constant(value=attn_ints(0)))), perm=[0, 2, 1, 3])
+    return op.Reshape(ctx, op.Constant(value=attn_ints(attn_b, attn_s, attn_e)))
+
+@ost.script()
+def attention_beit_rel_bias(x: ost.FLOAT[attn_b, attn_s, attn_e]) -> ost.FLOAT[attn_b, attn_s, attn_e]:
+    qkv = op.Add(op.Constant(value=attn_tensor(beit_qkv_b)), op.MatMul(x, op.Constant(value=attn_tensor(beit_qkv_w))))
+    qkv = op.Transpose(op.Reshape(qkv, op.Constant(value=attn_ints(attn_b, attn_s, 3, attn_h, -1))), perm=[2, 0, 3, 1, 4])
+    q, k, v = op.Split(qkv, op.Constant(value=attn_ints(1, 1, 1)), axis=0)
+    q = op.Squeeze(q, op.Constant(value=attn_ints(0)))
+    head_dim = op.Cast(op.Slice(op.Shape(q), op.Constant(value=attn_ints(-1)), op.Constant(value=attn_ints(9223372036854775807))), to=1)
+    inv_sqrt_d = op.Div(op.Constant(value=attn_tensor([1.0])), op.Sqrt(head_dim))
+    q = op.Mul(q, op.Sqrt(inv_sqrt_d))
+    k = op.Mul(op.Transpose(op.Squeeze(k, op.Constant(value=attn_ints(0))), perm=[0, 1, 3, 2]), op.Sqrt(inv_sqrt_d))
+    scores = op.Add(op.MatMul(q, k), op.Constant(value=attn_tensor(beit_rel_bias)))
+    ctx = op.Transpose(op.MatMul(op.Softmax(scores, axis=-1), op.Squeeze(v, op.Constant(value=attn_ints(0)))), perm=[0, 2, 1, 3])
+    return op.Reshape(ctx, op.Constant(value=attn_ints(attn_b, attn_s, attn_e)))
+
+@ost.script()
+def attention_siglip_mul_scale(x: ost.FLOAT[attn_b, attn_s, attn_e]) -> ost.FLOAT[attn_b, attn_s, attn_e]:
+    shape = op.Shape(x)
+    batch = op.Unsqueeze(op.Gather(shape, op.Constant(value=attn_ints(0, scalar=True)), axis=0), op.Constant(value=attn_ints(0)))
+    tokens = op.Unsqueeze(op.Gather(shape, op.Constant(value=attn_ints(1, scalar=True)), axis=0), op.Constant(value=attn_ints(0)))
+    heads = op.Concat(batch, tokens, op.Constant(value=attn_ints(attn_h)), op.Constant(value=attn_ints(attn_d)), axis=0)
+    q = op.Add(op.Constant(value=attn_tensor(siglip_q_b)), op.MatMul(x, op.Constant(value=attn_tensor(siglip_q_w))))
+    k = op.Add(op.Constant(value=attn_tensor(siglip_k_b)), op.MatMul(x, op.Constant(value=attn_tensor(siglip_k_w))))
+    v = op.Add(op.Constant(value=attn_tensor(siglip_v_b)), op.MatMul(x, op.Constant(value=attn_tensor(siglip_v_w))))
+    q = op.Transpose(op.Reshape(q, heads), perm=[0, 2, 1, 3])
+    k = op.Transpose(op.Reshape(k, heads), perm=[0, 2, 3, 1])
+    v = op.Transpose(op.Reshape(v, heads), perm=[0, 2, 1, 3])
+    scores = op.Mul(op.MatMul(q, k), op.Constant(value=attn_tensor(1.0 / np.sqrt(attn_d))))
+    probs = op.Cast(op.Cast(op.Softmax(scores, axis=-1), to=1), to=1)
+    ctx = op.Transpose(op.MatMul(probs, v), perm=[0, 2, 1, 3])
+    return op.Reshape(ctx, op.Constant(value=attn_ints(attn_b, attn_s, attn_e)))
+
+@ost.script()
+def attention_hiera_unbind(x: ost.FLOAT[attn_b, attn_s, attn_e]) -> ost.FLOAT[attn_b, attn_s, attn_e]:
+    qkv = op.Add(op.Constant(value=attn_tensor(hiera_qkv_b)), op.MatMul(x, op.Constant(value=attn_tensor(hiera_qkv_w))))
+    q, k, v = op.Split(op.Reshape(qkv, op.Constant(value=attn_ints(attn_b, attn_s, 3, attn_h, attn_d))), op.Constant(value=attn_ints(1, 1, 1)), axis=2)
+    q = op.Transpose(op.Squeeze(q, op.Constant(value=attn_ints(2))), perm=[0, 2, 1, 3])
+    k = op.Transpose(op.Squeeze(k, op.Constant(value=attn_ints(2))), perm=[0, 2, 3, 1])
+    v = op.Transpose(op.Squeeze(v, op.Constant(value=attn_ints(2))), perm=[0, 2, 1, 3])
+    q = op.Mul(q, op.Constant(value=attn_tensor([attn_d ** -0.25])))
+    k = op.Mul(k, op.Constant(value=attn_tensor([attn_d ** -0.25])))
+    ctx = op.Transpose(op.MatMul(op.Softmax(op.MatMul(q, k), axis=-1), v), perm=[0, 2, 1, 3])
+    return op.Reshape(ctx, op.Constant(value=attn_ints(attn_b, attn_s, attn_e)))
+
+for attn_model in [attention_vit_runtime_scale, attention_beit_rel_bias, attention_siglip_mul_scale, attention_hiera_unbind]:
+    make_model_and_data(attn_model, attn_weights(attn_b, attn_s, attn_e))
